@@ -1,37 +1,45 @@
 # Requires -Version 5.1
 
-# Compile C# Levenshtein distance function (Cross-platform and PS5.1 safe)
-if (-not ('FuzzyMatcher' -as [type])) {
-    Add-Type -TypeDefinition @'
-    public class FuzzyMatcher {
-        public static int Levenshtein(string s, string t) {
-            if (string.IsNullOrEmpty(s)) return string.IsNullOrEmpty(t) ? 0 : t.Length;
-            if (string.IsNullOrEmpty(t)) return s.Length;
-
-            s = s.ToLowerInvariant();
-            t = t.ToLowerInvariant();
-
-            int[,] d = new int[s.Length + 1, t.Length + 1];
-            for (int i = 0; i <= s.Length; i++) d[i, 0] = i;
-            for (int j = 0; j <= t.Length; j++) d[0, j] = j;
-
-            for (int i = 1; i <= s.Length; i++) {
-                for (int j = 1; j <= t.Length; j++) {
-                    int cost = (s[i - 1] == t[j - 1]) ? 0 : 1;
-                    d[i, j] = System.Math.Min(
-                        System.Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1),
-                        d[i - 1, j - 1] + cost
-                    );
-                }
-            }
-            return d[s.Length, t.Length];
-        }
-    }
-'@
-}
 
 # In-Memory Cache Variable Definition (Module Scope)
 $script:CountryLookupCache = $null
+
+
+# Compile C# Levenshtein distance function (Cross-platform and PS5.1 safe)
+if (-not ('FuzzyMatcher' -as [type])) {
+    Add-Type -TypeDefinition @'
+        public class FuzzyMatcher {
+            public static int Levenshtein(string s, string t) {
+                if (string.IsNullOrEmpty(s)) return string.IsNullOrEmpty(t) ? 0 : t.Length;
+                if (string.IsNullOrEmpty(t)) return s.Length;
+
+                // Allocate only two 1D arrays instead of a full 2D matrix
+                int[] v0 = new int[t.Length + 1];
+                int[] v1 = new int[t.Length + 1];
+
+                for (int i = 0; i <= t.Length; i++) v0[i] = i;
+
+                for (int i = 0; i < s.Length; i++) {
+                    v1[0] = i + 1;
+
+                    for (int j = 0; j < t.Length; j++) {
+                        int cost = (s[i] == t[j]) ? 0 : 1;
+                        v1[j + 1] = System.Math.Min(
+                            System.Math.Min(v1[j] + 1, v0[j + 1] + 1),
+                            v0[j] + cost
+                        );
+                    }
+
+                    // Copy current row to previous row
+                    System.Array.Copy(v1, v0, v0.Length);
+                }
+
+                return v1[t.Length];
+            }
+        }
+'@
+}
+
 
 # Text Normalization Helper (Internal)
 function ConvertTo-NormalizedText ([string]$text) {
@@ -41,6 +49,7 @@ function ConvertTo-NormalizedText ([string]$text) {
     $noPunctuation = $noDiacritics -replace '[\p{P}\p{S}\p{C}]', ' '
     return ($noPunctuation -replace '\s+', ' ').Trim().ToLowerInvariant()
 }
+
 
 # Helper to read and decompress cache file into Hashtable (Internal)
 function Import-CompressedCountryCache ([string]$Path) {
@@ -64,6 +73,7 @@ function Import-CompressedCountryCache ([string]$Path) {
         $fileStream.Dispose()
     }
 }
+
 
 # Data Download and Compressed Cache Generation Function (Public)
 function Update-ResolveCountryData {
@@ -144,14 +154,15 @@ function Update-ResolveCountryData {
     }
 }
 
+
 # Search Function with Compressed Disk Cache Integration (Public)
 function Resolve-Country {
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory = $true, Position = 0)]
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true)]
         [AllowNull()]
         [AllowEmptyString()]
-        [string]$SearchQuery,
+        [string]$InputString,
 
         [Parameter(Position = 1)]
         [ValidateSet(
@@ -168,116 +179,126 @@ function Resolve-Country {
         [string]$ReturnType = 'cca2',
 
         [Parameter()]
+        [object]$FallbackValue,
+
+        [Parameter()]
         [switch]$Reload
     )
 
-    $cacheFilePath = Join-Path -Path $PSScriptRoot -ChildPath 'ResolveCountry.Data.json.gz'
+    begin {
+        $cacheFilePath = Join-Path -Path $PSScriptRoot -ChildPath 'ResolveCountry.Data.json.gz'
 
-    # Fallback to reload if the cache is empty or forcefully requested
-    if ($Reload -or $null -eq $script:CountryLookupCache) {
-        if (-not $Reload -and (Test-Path -Path $cacheFilePath)) {
-            Write-Verbose 'Loading country lookup data from compressed JSON cache...'
-            $script:CountryLookupCache = Import-CompressedCountryCache -Path $cacheFilePath
-        } else {
-            Write-Verbose 'Generating country lookup data...'
-            $script:CountryLookupCache = Update-ResolveCountryData -CacheFilePath $cacheFilePath
-        }
-    }
-
-    $LookupTable = $script:CountryLookupCache
-
-    if ([string]::IsNullOrWhiteSpace($SearchQuery)) { return '' }
-
-    $CleanQuery = ConvertTo-NormalizedText $SearchQuery
-    $MatchedKey = $null
-
-    # Stage 1: Exact / Case-Insensitive Search
-    $FoundMatches = $LookupTable.GetEnumerator() | Where-Object {
-        $null -ne $_.Value.UniqueValues -and $_.Value.UniqueValues -icontains $SearchQuery
-    }
-
-    if ($FoundMatches) {
-        $MatchedKey = ($FoundMatches | Select-Object -First 1).Key
-    } else {
-        # Stage 2: Normalized Exact Search
-        $FoundMatches = $LookupTable.GetEnumerator() | Where-Object {
-            $uniqueVals = $_.Value.UniqueValues
-            if ($null -eq $uniqueVals) { return $false }
-
-            foreach ($val in $uniqueVals) {
-                if ((ConvertTo-NormalizedText $val) -eq $CleanQuery) { return $true }
+        # Load cache once for the entire pipeline execution
+        if ($Reload -or $null -eq $script:CountryLookupCache) {
+            if (-not $Reload -and (Test-Path -Path $cacheFilePath)) {
+                Write-Verbose 'Loading country lookup data from compressed JSON cache...'
+                $script:CountryLookupCache = Import-CompressedCountryCache -Path $cacheFilePath
+            } else {
+                Write-Verbose 'Generating country lookup data...'
+                $script:CountryLookupCache = Update-ResolveCountryData -CacheFilePath $cacheFilePath
             }
-            return $false
         }
+    }
 
-        if ($FoundMatches) {
-            $MatchedKey = ($FoundMatches | Select-Object -First 1).Key
+    process {
+        if ([string]::IsNullOrWhiteSpace($InputString)) {
+            $MatchedKey = $null
         } else {
-            # Stage 3: Token-Aware Fuzzy Search
-            $MaxErrorRate = 0.25
-            $MaxDistance = [Math]::Max(1, [Math]::Ceiling($CleanQuery.Length * $MaxErrorRate))
+            $CleanQuery = ConvertTo-NormalizedText $InputString
+            $MatchedKey = $null
 
-            $MatchResults = foreach ($entry in $LookupTable.GetEnumerator()) {
-                $uniqueVals = $entry.Value.UniqueValues
-                if ($null -eq $uniqueVals) { continue }
+            # Stage 1: Exact / Case-Insensitive Search
+            $FoundMatches = $script:CountryLookupCache.GetEnumerator() | Where-Object {
+                $null -ne $_.Value.UniqueValues -and $_.Value.UniqueValues -icontains $InputString
+            }
 
-                $bestDistForCountry = 999
+            if ($FoundMatches) {
+                $MatchedKey = ($FoundMatches | Select-Object -First 1).Key
+            } else {
+                # Stage 2: Normalized Exact Search
+                $FoundMatches = $script:CountryLookupCache.GetEnumerator() | Where-Object {
+                    $uniqueVals = $_.Value.UniqueValues
+                    if ($null -eq $uniqueVals) { return $false }
 
-                foreach ($val in $uniqueVals) {
-                    $cleanAlias = ConvertTo-NormalizedText $val
-                    if ([string]::IsNullOrWhiteSpace($cleanAlias)) { continue }
-
-                    $dist = [FuzzyMatcher]::Levenshtein($CleanQuery, $cleanAlias)
-                    if ($dist -lt $bestDistForCountry) {
-                        $bestDistForCountry = $dist
+                    foreach ($val in $uniqueVals) {
+                        if ((ConvertTo-NormalizedText $val) -eq $CleanQuery) { return $true }
                     }
+                    return $false
+                }
 
-                    $tokens = $cleanAlias -split ' '
-                    if ($tokens.Count -gt 1) {
-                        foreach ($token in $tokens) {
-                            $tokenDist = [FuzzyMatcher]::Levenshtein($CleanQuery, $token)
-                            if ($tokenDist -lt $bestDistForCountry) {
-                                $bestDistForCountry = $tokenDist
+                if ($FoundMatches) {
+                    $MatchedKey = ($FoundMatches | Select-Object -First 1).Key
+                } else {
+                    # Stage 3: Token-Aware Fuzzy Search
+                    $MaxErrorRate = 0.25
+                    $MaxDistance = [Math]::Max(1, [Math]::Ceiling($CleanQuery.Length * $MaxErrorRate))
+
+                    $MatchResults = foreach ($entry in $script:CountryLookupCache.GetEnumerator()) {
+                        $uniqueVals = $entry.Value.UniqueValues
+                        if ($null -eq $uniqueVals) { continue }
+
+                        $bestDistForCountry = 999
+
+                        foreach ($val in $uniqueVals) {
+                            $cleanAlias = ConvertTo-NormalizedText $val
+                            if ([string]::IsNullOrWhiteSpace($cleanAlias)) { continue }
+
+                            $dist = [FuzzyMatcher]::Levenshtein($CleanQuery, $cleanAlias)
+                            if ($dist -lt $bestDistForCountry) {
+                                $bestDistForCountry = $dist
+                            }
+
+                            $tokens = $cleanAlias -split ' '
+                            if ($tokens.Count -gt 1) {
+                                foreach ($token in $tokens) {
+                                    $tokenDist = [FuzzyMatcher]::Levenshtein($CleanQuery, $token)
+                                    if ($tokenDist -lt $bestDistForCountry) {
+                                        $bestDistForCountry = $tokenDist
+                                    }
+                                }
+                            }
+                        }
+
+                        if ($bestDistForCountry -le $MaxDistance) {
+                            [PSCustomObject]@{
+                                Key      = $entry.Key
+                                Distance = $bestDistForCountry
                             }
                         }
                     }
-                }
 
-                if ($bestDistForCountry -le $MaxDistance) {
-                    [PSCustomObject]@{
-                        Key      = $entry.Key
-                        Distance = $bestDistForCountry
+                    $BestMatch = $MatchResults | Sort-Object Distance | Select-Object -First 1
+                    if ($BestMatch) {
+                        $MatchedKey = $BestMatch.Key
                     }
                 }
             }
-
-            $BestMatch = $MatchResults | Sort-Object Distance | Select-Object -First 1
-            if ($BestMatch) {
-                $MatchedKey = $BestMatch.Key
-            }
         }
-    }
 
-    if (-not $MatchedKey) { return $null }
+        if (-not $MatchedKey) {
+            if ($PSBoundParameters.ContainsKey('FallbackValue')) {
+                return $FallbackValue
+            }
+            # Fallback to 'AT' or first entry as default target key
+            $MatchedKey = if ($script:CountryLookupCache.ContainsKey('AT')) { 'AT' } else { ($script:CountryLookupCache.Keys | Select-Object -First 1) }
+        }
 
-    # Map matched key to requested ReturnType
-    $country = $LookupTable[$MatchedKey].CountryObject
-    switch ($ReturnType) {
-        'cca2' { return $country.cca2 }
-        'cca3' { return $country.cca3 }
-        'ccn3' { return $country.ccn3 }
-        'name.common' { return $country.name.common }
-        'name.native.common' { return ($country.name.native.psobject.properties | Select-Object -First 1).Value.common }
-        'name.native.official' { return ($country.name.native.psobject.properties | Select-Object -First 1).Value.official }
-        'name.official' { return $country.name.official }
-        'tld' { return $country.tld }
-        'country' { return $country }
+        # Single return switch handles both matched search and default fallback!
+        $country = $script:CountryLookupCache[$MatchedKey].CountryObject
+        switch ($ReturnType) {
+            'cca2' { return $country.cca2 }
+            'cca3' { return $country.cca3 }
+            'ccn3' { return $country.ccn3 }
+            'name.common' { return $country.name.common }
+            'name.native.common' { return ($country.name.native.psobject.properties | Select-Object -First 1).Value.common }
+            'name.native.official' { return ($country.name.native.psobject.properties | Select-Object -First 1).Value.official }
+            'name.official' { return $country.name.official }
+            'tld' { return $country.tld }
+            'country' { return $country }
+        }
     }
 }
 
-# ==========================================
-# MODULE INITIALIZATION (RUNS ON IMPORT)
-# ==========================================
 
 # Export only the public functions; helper functions remain internal to the module
 Export-ModuleMember -Function Resolve-Country, Update-ResolveCountryData
