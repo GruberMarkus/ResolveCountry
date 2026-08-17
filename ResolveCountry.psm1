@@ -88,7 +88,6 @@ function Update-ResolveCountryData {
 
     try {
         Write-Verbose 'Downloading countries.json...'
-        # -UseBasicParsing is necessary for PS5.1 compatibility without IE engine
         Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/mledoze/countries/refs/heads/master/dist/countries.json' -OutFile 'countries.json' -UseBasicParsing
 
         $ImportCountries = Get-Content 'countries.json' -Raw | ConvertFrom-Json
@@ -97,7 +96,7 @@ function Update-ResolveCountryData {
         foreach ($ImportCountry in $ImportCountries) {
             if ([string]::IsNullOrWhiteSpace($ImportCountry.cca2)) { continue }
 
-            # Extract native names (Null-safe for PS 5.1)
+            # Extract native names
             $nativeValues = @()
             if ($null -ne $ImportCountry.name.native) {
                 $nativeValues = foreach ($nat in $ImportCountry.name.native.psobject.properties) {
@@ -106,7 +105,7 @@ function Update-ResolveCountryData {
                 }
             }
 
-            # Extract built-in translations (Null-safe for PS 5.1)
+            # Extract built-in translations
             $translationValues = @()
             if ($null -ne $ImportCountry.translations) {
                 $translationValues = foreach ($trans in $ImportCountry.translations.psobject.properties) {
@@ -151,6 +150,70 @@ function Update-ResolveCountryData {
     } finally {
         Set-Location -Path $originalLocation.Path
         Remove-Item -Path $tempDir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+
+# Custom country data configuration
+function Set-CountryLookupConfig {
+    [CmdletBinding()]
+    param (
+        [Parameter()]
+        [hashtable]$CustomCountries,
+
+        [Parameter()]
+        [hashtable]$CustomAliases
+    )
+
+    $cacheFilePath = Join-Path -Path $PSScriptRoot -ChildPath 'ResolveCountry.Data.json.gz'
+    if ($null -eq $script:CountryLookupCache) {
+        if (Test-Path -Path $cacheFilePath) {
+            $script:CountryLookupCache = Import-CompressedCountryCache -Path $cacheFilePath
+        } else {
+            $script:CountryLookupCache = Update-ResolveCountryData -CacheFilePath $cacheFilePath
+        }
+    }
+
+    if ($PSBoundParameters.ContainsKey('CustomCountries') -and $null -ne $CustomCountries) {
+        foreach ($key in $CustomCountries.Keys) {
+            $countryObj = $CustomCountries[$key]
+            $cca2Key = $key.ToString().ToUpperInvariant()
+
+            $nativeValues = if ($null -ne $countryObj.name.native) {
+                foreach ($nat in $countryObj.name.native.psobject.properties) { $nat.Value.official; $nat.Value.common }
+            } else { @() }
+
+            $uniqueVals = @(
+                $countryObj.name.official
+                $countryObj.name.common
+                $nativeValues
+                $countryObj.cca2
+                $countryObj.cca3
+                $countryObj.ccn3
+                $countryObj.altSpellings
+            ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+
+            $script:CountryLookupCache[$cca2Key] = [pscustomobject]@{
+                UniqueValues  = $uniqueVals
+                CountryObject = $countryObj
+            }
+        }
+    }
+
+    if ($PSBoundParameters.ContainsKey('CustomAliases') -and $null -ne $CustomAliases) {
+        foreach ($alias in $CustomAliases.Keys) {
+            $targetCca2 = $CustomAliases[$alias].ToString().ToUpperInvariant()
+
+            if ($script:CountryLookupCache.ContainsKey($targetCca2)) {
+                $currentValues = [System.Collections.Generic.List[string]]::new([string[]]$script:CountryLookupCache[$targetCca2].UniqueValues)
+                if (-not $currentValues.Contains($alias)) {
+                    $currentValues.Add($alias)
+                    $script:CountryLookupCache[$targetCca2].UniqueValues = $currentValues.ToArray()
+                }
+            } else {
+                Write-Warning "Ziel-Land '$targetCca2' für Alias '$alias' wurde im Cache nicht gefunden."
+            }
+        }
     }
 }
 
@@ -301,4 +364,4 @@ function Resolve-Country {
 
 
 # Export only the public functions; helper functions remain internal to the module
-Export-ModuleMember -Function Resolve-Country, Update-ResolveCountryData
+Export-ModuleMember -Function Resolve-Country, Set-CountryLookupConfig, Update-ResolveCountryData
