@@ -149,6 +149,8 @@ function Resolve-Country {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true, Position = 0)]
+        [AllowNull()]
+        [AllowEmptyString()]
         [string]$SearchQuery,
 
         [Parameter(Position = 1)]
@@ -184,7 +186,7 @@ function Resolve-Country {
 
     $LookupTable = $script:CountryLookupCache
 
-    if ([string]::IsNullOrWhiteSpace($SearchQuery)) { return $null }
+    if ([string]::IsNullOrWhiteSpace($SearchQuery)) { return '' }
 
     $CleanQuery = ConvertTo-NormalizedText $SearchQuery
     $MatchedKey = $null
