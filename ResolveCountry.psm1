@@ -146,6 +146,7 @@ function Update-ResolveCountryData {
         }
 
         Write-Verbose "Cache saved to compressed JSON: $CacheFilePath"
+
         return $Result
     } finally {
         Set-Location -Path $originalLocation.Path
