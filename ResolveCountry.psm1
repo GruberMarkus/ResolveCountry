@@ -343,11 +343,11 @@ function Resolve-Country {
             if ($PSBoundParameters.ContainsKey('FallbackValue')) {
                 return $FallbackValue
             }
-            # Fallback to 'AT' or first entry as default target key
-            $MatchedKey = if ($script:CountryLookupCache.ContainsKey('AT')) { 'AT' } else { ($script:CountryLookupCache.Keys | Select-Object -First 1) }
+
+            return $null
         }
 
-        # Single return switch handles both matched search and default fallback!
+        # Return the requested value for the matched country.
         $country = $script:CountryLookupCache[$MatchedKey].CountryObject
         switch ($ReturnType) {
             'cca2' { return $country.cca2 }
