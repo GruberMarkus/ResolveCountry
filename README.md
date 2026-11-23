@@ -55,6 +55,12 @@ Resolve-Country "United States of America"
 
 Resolve-Country "Deutschland"
 # Output: DE
+
+Resolve-County ""
+# Output: $null
+
+Resolve-County "SomeNonExistingCountry"
+# Output: $null
 ```
 
 **Handling typos using fuzzy matching:**
